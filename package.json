@@ -1,0 +1,52 @@
+{
+  "name": "orderflow",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OrderFlow — e-commerce order, inventory, payment-webhook, and notification system",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @orderflow/api",
+    "dev:api": "npm run dev -w @orderflow/api",
+    "dev:worker": "npm run worker:dev -w @orderflow/api",
+    "dev:web": "npm run dev -w @orderflow/web",
+    "build": "npm run build -w @orderflow/shared && npm run build -w @orderflow/api && npm run build -w @orderflow/web",
+    "start": "npm run start -w @orderflow/api",
+    "start:worker": "npm run worker -w @orderflow/api",
+    "test": "npm run test -w @orderflow/api",
+    "test:unit": "npm run test:unit -w @orderflow/api",
+    "test:integration": "npm run test:integration -w @orderflow/api",
+    "lint": "eslint . --ext .ts,.tsx",
+    "typecheck": "npm run typecheck -w @orderflow/shared && npm run typecheck -w @orderflow/api && npm run typecheck -w @orderflow/web",
+    "db:generate": "prisma generate --schema=prisma/schema.prisma",
+    "db:migrate": "prisma migrate deploy --schema=prisma/schema.prisma",
+    "db:migrate:dev": "prisma migrate dev --schema=prisma/schema.prisma",
+    "db:seed": "tsx prisma/seed.ts",
+    "db:reset": "prisma migrate reset --schema=prisma/schema.prisma --force",
+    "db:studio": "prisma studio --schema=prisma/schema.prisma",
+    "webhook:simulate": "npm run webhook:simulate -w @orderflow/api",
+    "format": "prettier --write \"**/*.{ts,tsx,json,md,yml,yaml}\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "@typescript-eslint/eslint-plugin": "^8.18.1",
+    "@typescript-eslint/parser": "^8.18.1",
+    "eslint": "^8.57.1",
+    "prettier": "^3.4.2",
+    "prisma": "^6.1.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.1.0",
+    "argon2": "^0.41.1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  }
+}
