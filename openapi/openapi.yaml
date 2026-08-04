@@ -1,0 +1,848 @@
+openapi: 3.1.0
+info:
+  title: OrderFlow API
+  version: 1.0.0
+  description: |
+    OrderFlow is an e-commerce order, inventory, payment-webhook, and notification system.
+    Money amounts are integer minor units (cents). Checkout requires an Idempotency-Key header.
+  contact:
+    name: OrderFlow
+servers:
+  - url: http://localhost:4000
+    description: Local development
+tags:
+  - name: Health
+  - name: Auth
+  - name: Products
+  - name: Inventory
+  - name: Cart
+  - name: Checkout
+  - name: Orders
+  - name: Webhooks
+  - name: Admin
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+              example:
+                success: true
+                data:
+                  status: ok
+                  service: orderflow-api
+
+  /ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe (database + Redis)
+      responses:
+        '200':
+          description: Ready
+        '503':
+          description: Dependencies unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /openapi.json:
+    get:
+      tags: [Health]
+      summary: OpenAPI document as JSON
+      responses:
+        '200':
+          description: OpenAPI document
+
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new customer account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              email: newuser@example.com
+              password: Password123!
+              firstName: Jane
+              lastName: Doe
+      responses:
+        '201':
+          description: Registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '409':
+          description: Email already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: customer@orderflow.dev
+              password: Password123!
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Invalid refresh token
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke refresh token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        '200':
+          description: Logged out
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current user profile
+        '401':
+          description: Unauthorized
+
+  /api/v1/products:
+    get:
+      tags: [Products]
+      summary: List products
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Search name or description
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: isActive
+          in: query
+          schema:
+            type: string
+            enum: ['true', 'false']
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [createdAt, name, priceCents]
+        - name: sortOrder
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+      responses:
+        '200':
+          description: Paginated product list
+    post:
+      tags: [Products]
+      summary: Create product (STAFF/ADMIN)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProductRequest'
+      responses:
+        '201':
+          description: Created
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+        '409':
+          description: SKU exists
+
+  /api/v1/products/{id}:
+    get:
+      tags: [Products]
+      summary: Get product by id
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Product
+        '404':
+          description: Not found
+    patch:
+      tags: [Products]
+      summary: Update product (STAFF/ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProductRequest'
+      responses:
+        '200':
+          description: Updated
+        '403':
+          description: Forbidden
+    delete:
+      tags: [Products]
+      summary: Soft-archive product (STAFF/ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Archived
+
+  /api/v1/inventory:
+    get:
+      tags: [Inventory]
+      summary: List inventory (STAFF/ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Inventory list
+        '403':
+          description: Forbidden
+
+  /api/v1/inventory/{productId}:
+    get:
+      tags: [Inventory]
+      summary: Get inventory for product
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Inventory record
+    patch:
+      tags: [Inventory]
+      summary: Adjust available quantity
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                availableQuantity:
+                  type: integer
+                  minimum: 0
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Updated inventory
+
+  /api/v1/inventory/{productId}/restock:
+    post:
+      tags: [Inventory]
+      summary: Restock product inventory
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity:
+                  type: integer
+                  minimum: 1
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Restocked
+
+  /api/v1/cart:
+    get:
+      tags: [Cart]
+      summary: Get active cart
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Cart with server-calculated totals
+    delete:
+      tags: [Cart]
+      summary: Clear cart
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Cleared cart
+
+  /api/v1/cart/items:
+    post:
+      tags: [Cart]
+      summary: Add item to cart
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [productId, quantity]
+              properties:
+                productId:
+                  type: string
+                  format: uuid
+                quantity:
+                  type: integer
+                  minimum: 1
+      responses:
+        '201':
+          description: Item added
+        '409':
+          description: Insufficient inventory
+
+  /api/v1/cart/items/{productId}:
+    patch:
+      tags: [Cart]
+      summary: Update cart item quantity
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity:
+                  type: integer
+                  minimum: 1
+      responses:
+        '200':
+          description: Updated
+    delete:
+      tags: [Cart]
+      summary: Remove cart item
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Removed
+
+  /api/v1/checkout:
+    post:
+      tags: [Checkout]
+      summary: Checkout active cart
+      description: |
+        Requires Idempotency-Key. Reserves inventory, creates order + pending payment,
+        writes outbox event, clears cart — all in one transaction.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '201':
+          description: Order created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '400':
+          description: Empty cart or missing Idempotency-Key
+        '409':
+          description: Insufficient inventory or idempotency conflict
+
+  /api/v1/orders:
+    get:
+      tags: [Orders]
+      summary: List orders (own orders for customers)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Order list
+
+  /api/v1/orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get order by id
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Order
+        '403':
+          description: Not your order
+        '404':
+          description: Not found
+
+  /api/v1/orders/{id}/cancel:
+    post:
+      tags: [Orders]
+      summary: Cancel order
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Cancelled
+        '409':
+          description: Invalid status
+
+  /api/v1/webhooks/payments:
+    post:
+      tags: [Webhooks]
+      summary: Payment provider webhook simulator
+      description: |
+        Signed with HMAC-SHA256 over `{timestamp}.{rawBody}` using PAYMENT_WEBHOOK_SECRET.
+      parameters:
+        - name: x-payment-signature
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: x-payment-timestamp
+          in: header
+          required: true
+          schema:
+            type: string
+            description: Unix timestamp (seconds)
+        - name: x-payment-event-id
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentWebhookPayload'
+            examples:
+              succeeded:
+                value:
+                  event: payment.succeeded
+                  paymentId: 00000000-0000-0000-0000-000000000001
+                  orderId: 00000000-0000-0000-0000-000000000002
+              failed:
+                value:
+                  event: payment.failed
+                  paymentId: 00000000-0000-0000-0000-000000000001
+                  orderId: 00000000-0000-0000-0000-000000000002
+                  reason: card declined
+      responses:
+        '200':
+          description: Processed or duplicate ignored
+        '401':
+          description: Invalid signature or stale timestamp
+
+  /api/v1/admin/users:
+    get:
+      tags: [Admin]
+      summary: List users (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Users
+        '403':
+          description: Forbidden
+
+  /api/v1/admin/users/{id}:
+    patch:
+      tags: [Admin]
+      summary: Update user role or status
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role:
+                  type: string
+                  enum: [CUSTOMER, STAFF, ADMIN]
+                status:
+                  type: string
+                  enum: [ACTIVE, SUSPENDED, DELETED]
+      responses:
+        '200':
+          description: Updated
+
+  /api/v1/admin/stats:
+    get:
+      tags: [Admin]
+      summary: Basic system stats
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Counts
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+      description: Client-generated unique key scoped per user for checkout
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      properties:
+        success:
+          type: boolean
+          const: true
+        data: {}
+        meta:
+          $ref: '#/components/schemas/PaginationMeta'
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            requestId:
+              type: string
+            details: {}
+      example:
+        success: false
+        error:
+          code: INSUFFICIENT_INVENTORY
+          message: Requested quantity is not available
+          requestId: 550e8400-e29b-41d4-a716-446655440000
+
+    PaginationMeta:
+      type: object
+      properties:
+        page:
+          type: integer
+        limit:
+          type: integer
+        total:
+          type: integer
+        totalPages:
+          type: integer
+        hasNext:
+          type: boolean
+        hasPrev:
+          type: boolean
+
+    RegisterRequest:
+      type: object
+      required: [email, password, firstName, lastName]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+        firstName:
+          type: string
+        lastName:
+          type: string
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    AuthResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            user:
+              $ref: '#/components/schemas/User'
+            accessToken:
+              type: string
+            refreshToken:
+              type: string
+            expiresIn:
+              type: string
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        firstName:
+          type: string
+        lastName:
+          type: string
+        role:
+          type: string
+          enum: [CUSTOMER, STAFF, ADMIN]
+        status:
+          type: string
+
+    CreateProductRequest:
+      type: object
+      required: [sku, name, priceCents]
+      properties:
+        sku:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        priceCents:
+          type: integer
+          minimum: 1
+          description: Price in minor units (cents)
+        category:
+          type: string
+        initialQuantity:
+          type: integer
+          minimum: 0
+
+    UpdateProductRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        priceCents:
+          type: integer
+        category:
+          type: string
+        isActive:
+          type: boolean
+
+    OrderResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            id:
+              type: string
+              format: uuid
+            status:
+              type: string
+              enum:
+                - PENDING_PAYMENT
+                - PAID
+                - PAYMENT_FAILED
+                - PROCESSING
+                - SHIPPED
+                - COMPLETED
+                - CANCELLED
+                - REFUNDED
+            totalCents:
+              type: integer
+            payment:
+              type: object
+              properties:
+                id:
+                  type: string
+                status:
+                  type: string
+                  enum: [PENDING, SUCCEEDED, FAILED, REFUNDED]
+
+    PaymentWebhookPayload:
+      type: object
+      required: [event, paymentId, orderId]
+      properties:
+        event:
+          type: string
+          enum: [payment.succeeded, payment.failed, payment.refunded]
+        paymentId:
+          type: string
+          format: uuid
+        orderId:
+          type: string
+          format: uuid
+        amountCents:
+          type: integer
+        reason:
+          type: string
