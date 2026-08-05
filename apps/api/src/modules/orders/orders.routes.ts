@@ -69,3 +69,57 @@ ordersRouter.post(
     }
   },
 );
+
+ordersRouter.post(
+  '/:id/process',
+  authorize('STAFF', 'ADMIN'),
+  async (req, res, next) => {
+    try {
+      const order = await ordersService.transitionOrder(
+        param(req.params.id),
+        'process',
+        req.user!.id,
+        req.user!.role,
+      );
+      sendSuccess(res, order);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+ordersRouter.post(
+  '/:id/ship',
+  authorize('STAFF', 'ADMIN'),
+  async (req, res, next) => {
+    try {
+      const order = await ordersService.transitionOrder(
+        param(req.params.id),
+        'ship',
+        req.user!.id,
+        req.user!.role,
+      );
+      sendSuccess(res, order);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+ordersRouter.post(
+  '/:id/complete',
+  authorize('STAFF', 'ADMIN'),
+  async (req, res, next) => {
+    try {
+      const order = await ordersService.transitionOrder(
+        param(req.params.id),
+        'complete',
+        req.user!.id,
+        req.user!.role,
+      );
+      sendSuccess(res, order);
+    } catch (err) {
+      next(err);
+    }
+  },
+);

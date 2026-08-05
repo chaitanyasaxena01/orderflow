@@ -1,4 +1,10 @@
-import { IDEMPOTENCY_SCOPES, lineTotalCents, OUTBOX_EVENT_TYPES, sumCents } from '@orderflow/shared';
+import {
+  canTransitionOrder,
+  IDEMPOTENCY_SCOPES,
+  lineTotalCents,
+  OUTBOX_EVENT_TYPES,
+  sumCents,
+} from '@orderflow/shared';
 import { prisma } from '../../lib/prisma.js';
 import {
   AppError,
@@ -10,7 +16,9 @@ import {
 import { generateIdempotencyRequestHash } from '../../lib/crypto.js';
 import { releaseReservation, reserveInventory } from '../inventory/inventory.service.js';
 import { buildPaginationMeta } from '../../lib/response.js';
-import type { Prisma } from '@prisma/client';
+import { incMetric } from '../../lib/metrics.js';
+import { logger } from '../../lib/logger.js';
+import type { OrderStatus, Prisma } from '@prisma/client';
 
 function serializeOrder(
   order: {
@@ -74,6 +82,17 @@ function serializeOrder(
   };
 }
 
+function isRetryableCheckoutError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: string }).code;
+  const message = String((err as { message?: string }).message ?? '');
+  const metaMsg = String((err as { meta?: { message?: string } }).meta?.message ?? '');
+  return (
+    code === 'P2034' ||
+    (code === 'P2010' && (message.includes('40001') || metaMsg.includes('concurrent')))
+  );
+}
+
 export async function checkout(
   userId: string,
   idempotencyKey: string | undefined,
@@ -83,6 +102,46 @@ export async function checkout(
     throw new ValidationError('Idempotency-Key header is required');
   }
 
+  const maxAttempts = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const result = await checkoutOnce(userId, idempotencyKey, requestBody);
+      if (!result.fromCache) {
+        incMetric('checkout.success');
+      }
+      return result;
+    } catch (err) {
+      lastError = err;
+      if (isRetryableCheckoutError(err) && attempt < maxAttempts) {
+        logger.warn(
+          { userId, attempt, err },
+          'Retryable checkout conflict; retrying',
+        );
+        await new Promise((r) => setTimeout(r, 25 * attempt));
+        continue;
+      }
+      if (isRetryableCheckoutError(err)) {
+        incMetric('checkout.conflict');
+        throw new AppError(
+          'CHECKOUT_CONFLICT',
+          'Checkout conflict due to concurrent update; retry with the same Idempotency-Key',
+          409,
+        );
+      }
+      throw err;
+    }
+  }
+
+  throw lastError;
+}
+
+async function checkoutOnce(
+  userId: string,
+  idempotencyKey: string,
+  requestBody: unknown,
+) {
   const scope = IDEMPOTENCY_SCOPES.CHECKOUT;
   const requestHash = generateIdempotencyRequestHash(requestBody ?? {});
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
@@ -102,6 +161,14 @@ export async function checkout(
         409,
       );
     }
+    // Incomplete placeholder from a crashed attempt
+    if (existing.responseStatus === 0) {
+      throw new AppError(
+        'IDEMPOTENCY_IN_PROGRESS',
+        'A checkout with this Idempotency-Key is already in progress; retry shortly',
+        409,
+      );
+    }
     return {
       status: existing.responseStatus,
       body: existing.responseBody as Record<string, unknown>,
@@ -110,8 +177,7 @@ export async function checkout(
   }
 
   // Perform checkout in a transaction.
-  // ReadCommitted + FOR UPDATE + conditional inventory update is enough to prevent
-  // overselling; Serializable can surface 40001 serialization failures as 500s.
+  // ReadCommitted + FOR UPDATE + conditional inventory update prevents overselling.
   try {
     const result = await prisma.$transaction(
       async (tx) => {
@@ -312,18 +378,8 @@ export async function checkout(
 
     return result;
   } catch (err) {
-    // Map rare transaction conflicts to a client-retryable conflict
-    if (
-      err &&
-      typeof err === 'object' &&
-      'code' in err &&
-      (err as { code?: string }).code === 'P2034'
-    ) {
-      throw new AppError(
-        'CHECKOUT_CONFLICT',
-        'Checkout conflict due to concurrent update; please retry',
-        409,
-      );
+    if (isRetryableCheckoutError(err)) {
+      throw err; // outer checkout() retries
     }
     throw err;
   }
@@ -440,6 +496,75 @@ export async function cancelOrder(orderId: string, userId: string, role: string)
     }).catch(() => {
       // dedupe unique — already cancelled notification
     });
+
+    return serializeOrder(updated);
+  });
+}
+
+const FULFILLMENT_ACTIONS = {
+  process: 'PROCESSING',
+  ship: 'SHIPPED',
+  complete: 'COMPLETED',
+} as const;
+
+export type FulfillmentAction = keyof typeof FULFILLMENT_ACTIONS;
+
+/**
+ * Staff/admin order lifecycle transitions after payment.
+ * Uses canTransitionOrder for allowed edges.
+ */
+export async function transitionOrder(
+  orderId: string,
+  action: FulfillmentAction,
+  actorUserId: string,
+  actorRole: string,
+) {
+  if (actorRole !== 'STAFF' && actorRole !== 'ADMIN') {
+    throw new ForbiddenError('Only staff or admin can fulfill orders');
+  }
+
+  const targetStatus = FULFILLMENT_ACTIONS[action] as OrderStatus;
+
+  return prisma.$transaction(async (tx) => {
+    const order = await tx.order.findUnique({
+      where: { id: orderId },
+      include: { items: true, payment: true },
+    });
+    if (!order) {
+      throw new NotFoundError('Order not found');
+    }
+
+    if (!canTransitionOrder(order.status, targetStatus)) {
+      throw new AppError(
+        'INVALID_STATUS',
+        `Cannot transition order from ${order.status} to ${targetStatus}`,
+        409,
+      );
+    }
+
+    const updated = await tx.order.update({
+      where: { id: orderId },
+      data: { status: targetStatus },
+      include: { items: true, payment: true },
+    });
+
+    await tx.auditLog.create({
+      data: {
+        userId: actorUserId,
+        action: `ORDER_${action.toUpperCase()}`,
+        entityType: 'Order',
+        entityId: orderId,
+        metadata: {
+          from: order.status,
+          to: targetStatus,
+        },
+      },
+    });
+
+    logger.info(
+      { orderId, from: order.status, to: targetStatus, actorUserId },
+      'Order fulfillment transition',
+    );
 
     return serializeOrder(updated);
   });
