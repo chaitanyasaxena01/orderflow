@@ -1,0 +1,85 @@
+# Sample Render Blueprint for OrderFlow (API + worker).
+# Secrets are configured in the Render dashboard — never commit real values.
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: orderflow-api
+    runtime: node
+    plan: free
+    rootDir: .
+    buildCommand: npm ci && npm run db:generate && npm run build -w @orderflow/shared && npm run build -w @orderflow/api
+    startCommand: npx prisma migrate deploy --schema=prisma/schema.prisma && node apps/api/dist/server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4000
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: PAYMENT_WEBHOOK_SECRET
+        generateValue: true
+      - key: CORS_ORIGIN
+        sync: false
+      - key: LOG_LEVEL
+        value: info
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+
+  - type: worker
+    name: orderflow-worker
+    runtime: node
+    plan: free
+    rootDir: .
+    buildCommand: npm ci && npm run db:generate && npm run build -w @orderflow/shared && npm run build -w @orderflow/api
+    startCommand: node apps/api/dist/worker.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromService:
+          name: orderflow-api
+          type: web
+          envVarKey: DATABASE_URL
+      - key: DIRECT_URL
+        fromService:
+          name: orderflow-api
+          type: web
+          envVarKey: DIRECT_URL
+      - key: REDIS_URL
+        fromService:
+          name: orderflow-api
+          type: web
+          envVarKey: REDIS_URL
+      - key: JWT_ACCESS_SECRET
+        fromService:
+          name: orderflow-api
+          type: web
+          envVarKey: JWT_ACCESS_SECRET
+      - key: JWT_REFRESH_SECRET
+        fromService:
+          name: orderflow-api
+          type: web
+          envVarKey: JWT_REFRESH_SECRET
+      - key: PAYMENT_WEBHOOK_SECRET
+        fromService:
+          name: orderflow-api
+          type: web
+          envVarKey: PAYMENT_WEBHOOK_SECRET
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: LOG_LEVEL
+        value: info

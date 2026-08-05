@@ -363,13 +363,37 @@ CI (`.github/workflows/ci.yml`) runs install → Prisma generate → migrate →
 
 ---
 
+## Reliability upgrades (Tier 1 / Tier 2)
+
+| Area | Implementation |
+|------|----------------|
+| Rate limits | Redis-backed global + stricter auth limits (20/min) |
+| Checkout | Up to 3 retries on lock/serialization conflicts; same `Idempotency-Key` |
+| Isolation | `ReadCommitted` + `SELECT … FOR UPDATE` + conditional stock update |
+| Auth | Refresh-token family revoke on reuse; `POST /auth/logout-all` |
+| Outbox | Reclaim stuck `PROCESSING` (>5m); admin redrive of `FAILED` |
+| Fulfillment | Staff `process` → `ship` → `complete` with audit log |
+| Search | Postgres FTS + trigram indexes + ILIKE fallback |
+| Ops | `/ready` outbox counts, `/metrics` counters, admin outbox/webhooks/adjustments |
+| Deploy | Sample `render.yaml` + Neon/Upstash notes |
+
+## Deploy notes (free-tier friendly)
+
+1. Create **Neon** Postgres and **Upstash** Redis; copy URLs into env.
+2. Set strong `JWT_*` and `PAYMENT_WEBHOOK_SECRET` values.
+3. Use `render.yaml` (or Fly/Railway) for **API web** + **worker** processes.
+4. Run migrations on deploy (`prisma migrate deploy`).
+5. Optional: set `RESEND_API_KEY` for real email; otherwise console adapter logs messages.
+
+Do not commit secrets. Generate values in the host dashboard.
+
 ## Known tradeoffs
 
 - Single active cart per user; single-warehouse inventory
-- Rate limiter is process-local unless you wire a Redis store
+- Rate limiter uses Redis when available; falls back to memory if Redis store init fails
 - Payment provider is a simulator by design
 - Frontend is a workflow demo, not a full storefront
-- Under extreme write contention you may still want client retries on rare conflict responses
+- Checkout conflicts after retries still return `409 CHECKOUT_CONFLICT` — clients should retry with the **same** Idempotency-Key
 
 ---
 
