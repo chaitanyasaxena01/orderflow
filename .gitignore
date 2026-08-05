@@ -6,6 +6,8 @@ dist/
 build/
 coverage/
 *.tsbuildinfo
+packages/shared/dist/
+packages/**/tsconfig.tsbuildinfo
 
 # Environment
 .env

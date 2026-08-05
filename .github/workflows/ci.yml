@@ -64,6 +64,10 @@ jobs:
       - name: Generate Prisma client
         run: npm run db:generate
 
+      - name: Build shared package
+        # API/web resolve @orderflow/shared from packages/shared/dist
+        run: npm run build -w @orderflow/shared
+
       - name: Run migrations
         run: npx prisma migrate deploy --schema=prisma/schema.prisma
 
