@@ -2,6 +2,7 @@ import { Queue, Worker, type Job } from 'bullmq';
 import { prisma } from '../../lib/prisma.js';
 import { getRedis } from '../../lib/redis.js';
 import { logger } from '../../lib/logger.js';
+import { incMetric } from '../../lib/metrics.js';
 import {
   buildOrderEmail,
   createEmailAdapter,
@@ -9,6 +10,9 @@ import {
 } from './email.adapter.js';
 
 export const NOTIFICATION_QUEUE = 'notifications';
+
+/** Stuck PROCESSING rows older than this are reclaimed as PENDING. */
+const OUTBOX_STUCK_MS = 5 * 60 * 1000;
 
 export interface NotificationJobData {
   outboxEventId: string;
@@ -39,11 +43,32 @@ export function getNotificationQueue(): Queue<NotificationJobData> {
   return queue;
 }
 
+/** Reclaim outbox rows stuck in PROCESSING (worker crash mid-job). */
+export async function reclaimStuckOutbox(): Promise<number> {
+  const cutoff = new Date(Date.now() - OUTBOX_STUCK_MS);
+  const result = await prisma.outboxEvent.updateMany({
+    where: {
+      status: 'PROCESSING',
+      updatedAt: { lt: cutoff },
+    },
+    data: {
+      status: 'PENDING',
+      lastError: 'Reclaimed after stuck PROCESSING timeout',
+    },
+  });
+  if (result.count > 0) {
+    logger.warn({ count: result.count }, 'Reclaimed stuck outbox events');
+  }
+  return result.count;
+}
+
 /**
  * Drain pending outbox events into BullMQ jobs.
  * Safe to call periodically from the worker.
  */
 export async function drainOutbox(limit = 50): Promise<number> {
+  await reclaimStuckOutbox();
+
   const events = await prisma.outboxEvent.findMany({
     where: { status: 'PENDING' },
     orderBy: { createdAt: 'asc' },
@@ -65,7 +90,6 @@ export async function drainOutbox(limit = 50): Promise<number> {
     const payload = event.payload as NotificationJobData['payload'];
     try {
       // BullMQ custom job IDs cannot contain ':' — sanitize dedupeKey.
-      // DB unique(dedupeKey) remains the primary exactly-once guard.
       const jobId = event.dedupeKey.replace(/:/g, '__');
       await q.add(
         event.eventType,
@@ -79,19 +103,42 @@ export async function drainOutbox(limit = 50): Promise<number> {
         },
       );
       enqueued += 1;
+      incMetric('outbox.enqueued');
     } catch (err) {
+      // Job may already exist from a previous attempt — treat as success
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('already exists') || message.includes('Job with this id')) {
+        enqueued += 1;
+        continue;
+      }
       logger.error({ err, outboxEventId: event.id }, 'Failed to enqueue outbox event');
       await prisma.outboxEvent.update({
         where: { id: event.id },
         data: {
           status: 'PENDING',
-          lastError: err instanceof Error ? err.message : 'enqueue failed',
+          lastError: message,
         },
       });
     }
   }
 
   return enqueued;
+}
+
+/** Admin: mark FAILED outbox events back to PENDING for redrive. */
+export async function redriveFailedOutbox(ids?: string[]): Promise<number> {
+  const where = ids?.length
+    ? { id: { in: ids }, status: 'FAILED' as const }
+    : { status: 'FAILED' as const };
+
+  const result = await prisma.outboxEvent.updateMany({
+    where,
+    data: {
+      status: 'PENDING',
+      lastError: null,
+    },
+  });
+  return result.count;
 }
 
 async function processNotificationJob(
@@ -126,8 +173,11 @@ async function processNotificationJob(
     },
   });
 
+  incMetric('outbox.completed');
+  incMetric('notifications.sent');
+
   logger.info(
-    { outboxEventId, eventType, to: payload.email, jobId: job.id },
+    { outboxEventId, eventType, to: payload.email, jobId: job.id, orderId: payload.orderId },
     'Notification sent',
   );
 }
@@ -159,6 +209,7 @@ export function createNotificationWorker(): Worker<NotificationJobData> {
             lastError: err.message,
           },
         });
+        incMetric('outbox.failed');
       } else {
         await prisma.outboxEvent.update({
           where: { id: job.data.outboxEventId },

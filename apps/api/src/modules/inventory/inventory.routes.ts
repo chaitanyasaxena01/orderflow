@@ -20,6 +20,24 @@ inventoryRouter.get('/', validate(paginationSchema, 'query'), async (req, res, n
   }
 });
 
+inventoryRouter.get(
+  '/:productId/adjustments',
+  validate(paginationSchema, 'query'),
+  async (req, res, next) => {
+    try {
+      const { page, limit } = req.query as unknown as { page: number; limit: number };
+      const result = await inventoryService.listAdjustments(
+        param(req.params.productId),
+        page,
+        limit,
+      );
+      sendSuccess(res, result.adjustments, 200, result.meta);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
 inventoryRouter.get('/:productId', async (req, res, next) => {
   try {
     const inv = await inventoryService.getInventory(param(req.params.productId));

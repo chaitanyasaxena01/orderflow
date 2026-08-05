@@ -169,6 +169,35 @@ export async function releaseReservation(
   `;
 }
 
+export async function listAdjustments(productId: string, page: number, limit: number) {
+  const inv = await prisma.inventory.findUnique({ where: { productId } });
+  if (!inv) {
+    throw new NotFoundError('Inventory not found for product');
+  }
+
+  const where = { productId };
+  const [total, rows] = await Promise.all([
+    prisma.inventoryAdjustment.count({ where }),
+    prisma.inventoryAdjustment.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip: (page - 1) * limit,
+      take: limit,
+    }),
+  ]);
+
+  return {
+    adjustments: rows.map((r) => ({
+      id: r.id,
+      type: r.type,
+      quantityDelta: r.quantityDelta,
+      reason: r.reason,
+      createdAt: r.createdAt.toISOString(),
+    })),
+    meta: buildPaginationMeta(page, limit, total),
+  };
+}
+
 export async function convertReservationToSold(
   tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
   productId: string,

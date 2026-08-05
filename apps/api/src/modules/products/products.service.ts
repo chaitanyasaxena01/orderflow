@@ -2,7 +2,7 @@ import { prisma } from '../../lib/prisma.js';
 import { ConflictError, NotFoundError } from '../../lib/errors.js';
 import { buildPaginationMeta } from '../../lib/response.js';
 import type { CreateProductInput, UpdateProductInput } from '@orderflow/shared';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 
 function serializeProduct(
   product: {
@@ -57,17 +57,78 @@ export async function listProducts(query: {
     archivedAt: null,
   };
 
-  if (query.q) {
-    where.OR = [
-      { name: { contains: query.q, mode: 'insensitive' } },
-      { description: { contains: query.q, mode: 'insensitive' } },
-    ];
-  }
   if (query.category) {
     where.category = query.category;
   }
   if (query.isActive !== undefined) {
     where.isActive = query.isActive;
+  }
+
+  // Full-text + ILIKE hybrid search when q is present (uses FTS index when available).
+  if (query.q && query.q.trim().length > 0) {
+    const q = query.q.trim();
+    const skip = (query.page - 1) * query.limit;
+    const like = `%${q}%`;
+    try {
+      const filters: Prisma.Sql[] = [
+        Prisma.sql`p.archived_at IS NULL`,
+        Prisma.sql`(
+          to_tsvector('english', coalesce(p.name, '') || ' ' || coalesce(p.description, ''))
+            @@ plainto_tsquery('english', ${q})
+          OR p.name ILIKE ${like}
+          OR p.description ILIKE ${like}
+        )`,
+      ];
+      if (query.category) {
+        filters.push(Prisma.sql`p.category = ${query.category}`);
+      }
+      if (query.isActive !== undefined) {
+        filters.push(Prisma.sql`p.is_active = ${query.isActive}`);
+      }
+
+      const whereSql = Prisma.join(filters, ' AND ');
+
+      const rows = await prisma.$queryRaw<Array<{ id: string; total: bigint }>>`
+        SELECT p.id, COUNT(*) OVER() AS total
+        FROM products p
+        WHERE ${whereSql}
+        ORDER BY
+          ts_rank(
+            to_tsvector('english', coalesce(p.name, '') || ' ' || coalesce(p.description, '')),
+            plainto_tsquery('english', ${q})
+          ) DESC,
+          p.created_at DESC
+        LIMIT ${query.limit}
+        OFFSET ${skip}
+      `;
+
+      const total = rows.length > 0 ? Number(rows[0]!.total) : 0;
+      const ids = rows.map((r) => r.id);
+      if (ids.length === 0) {
+        return {
+          products: [],
+          meta: buildPaginationMeta(query.page, query.limit, 0),
+        };
+      }
+
+      const products = await prisma.product.findMany({
+        where: { id: { in: ids } },
+        include: { inventory: true },
+      });
+      const byId = new Map(products.map((p) => [p.id, p]));
+      const ordered = ids.map((id) => byId.get(id)!).filter(Boolean);
+
+      return {
+        products: ordered.map(serializeProduct),
+        meta: buildPaginationMeta(query.page, query.limit, total),
+      };
+    } catch {
+      // FTS unavailable — fall through to ILIKE
+      where.OR = [
+        { name: { contains: q, mode: 'insensitive' } },
+        { description: { contains: q, mode: 'insensitive' } },
+      ];
+    }
   }
 
   const [total, products] = await Promise.all([

@@ -14,7 +14,9 @@ import {
   convertReservationToSold,
   releaseReservation,
 } from '../inventory/inventory.service.js';
-import type { Prisma } from '@prisma/client';
+import { incMetric } from '../../lib/metrics.js';
+import { logger } from '../../lib/logger.js';
+import { Prisma } from '@prisma/client';
 
 export async function handlePaymentWebhook(params: {
   rawBody: string;
@@ -57,7 +59,19 @@ export async function handlePaymentWebhook(params: {
   }
   const payload = payloadResult.data;
 
-  // Idempotent insert of event id
+  // Fast-path duplicate check (avoids Prisma error log noise on unique violations)
+  const existingEvent = await prisma.paymentWebhookEvent.findUnique({
+    where: { providerEventId: eventId },
+  });
+  if (existingEvent) {
+    incMetric('webhook.duplicate');
+    logger.info({ eventId }, 'Duplicate payment webhook ignored');
+    return {
+      duplicate: true,
+      message: 'Event already processed',
+    };
+  }
+
   try {
     await prisma.paymentWebhookEvent.create({
       data: {
@@ -66,12 +80,16 @@ export async function handlePaymentWebhook(params: {
         payload: payload as unknown as Prisma.InputJsonValue,
       },
     });
-  } catch {
-    // Unique constraint — already processed
-    return {
-      duplicate: true,
-      message: 'Event already processed',
-    };
+  } catch (err) {
+    // Race: another request inserted the same event id
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+      incMetric('webhook.duplicate');
+      return {
+        duplicate: true,
+        message: 'Event already processed',
+      };
+    }
+    throw err;
   }
 
   return prisma.$transaction(async (tx) => {
@@ -150,6 +168,11 @@ export async function handlePaymentWebhook(params: {
         },
       }).catch(() => undefined);
 
+      incMetric('webhook.processed');
+      logger.info(
+        { paymentId: payment.id, orderId: payment.orderId, event: payload.event },
+        'Payment webhook processed',
+      );
       return { duplicate: false, status: 'SUCCEEDED' };
     }
 
@@ -213,6 +236,11 @@ export async function handlePaymentWebhook(params: {
         },
       }).catch(() => undefined);
 
+      incMetric('webhook.processed');
+      logger.info(
+        { paymentId: payment.id, orderId: payment.orderId, event: payload.event },
+        'Payment webhook processed',
+      );
       return { duplicate: false, status: 'FAILED' };
     }
 
@@ -262,6 +290,11 @@ export async function handlePaymentWebhook(params: {
       }
     }
 
+    incMetric('webhook.processed');
+    logger.info(
+      { paymentId: payment.id, orderId: payment.orderId, event: payload.event },
+      'Payment webhook processed',
+    );
     return { duplicate: false, status: 'REFUNDED' };
   });
 }
