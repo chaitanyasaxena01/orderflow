@@ -15,6 +15,7 @@ import {
   ValidationError,
 } from '../../lib/errors.js';
 import { getEnv } from '../../config/env.js';
+import { logger } from '../../lib/logger.js';
 import type { RegisterInput, LoginInput } from '@orderflow/shared';
 
 function publicUser(user: {
@@ -80,14 +81,13 @@ async function issueTokens(userId: string, email: string, role: 'CUSTOMER' | 'ST
   const env = getEnv();
   const jti = randomUUID();
   const rawRefresh = generateRefreshToken();
-  const tokenHash = hashToken(rawRefresh);
   const expiresAt = new Date(Date.now() + parseDurationToMs(env.JWT_REFRESH_EXPIRES_IN));
 
   await prisma.refreshToken.create({
     data: {
       id: jti,
       userId,
-      tokenHash,
+      tokenHash: hashToken(rawRefresh),
       expiresAt,
     },
   });
@@ -95,8 +95,7 @@ async function issueTokens(userId: string, email: string, role: 'CUSTOMER' | 'ST
   const accessToken = signAccessToken({ sub: userId, email, role });
   const refreshTokenJwt = signRefreshToken({ sub: userId, jti });
 
-  // Client receives JWT refresh token; the opaque secret is embedded as jti lookup + we store hash of a random token
-  // Simpler approach: store hash of the JWT itself for revocation
+  // Store hash of the JWT for revocation lookups
   await prisma.refreshToken.update({
     where: { id: jti },
     data: { tokenHash: hashToken(refreshTokenJwt) },
@@ -107,6 +106,15 @@ async function issueTokens(userId: string, email: string, role: 'CUSTOMER' | 'ST
     refreshToken: refreshTokenJwt,
     expiresIn: env.JWT_ACCESS_EXPIRES_IN,
   };
+}
+
+/** Revoke every refresh token for a user (session family / logout-all). */
+export async function revokeAllRefreshTokens(userId: string): Promise<number> {
+  const result = await prisma.refreshToken.updateMany({
+    where: { userId, revokedAt: null },
+    data: { revokedAt: new Date() },
+  });
+  return result.count;
 }
 
 export async function refresh(refreshToken: string) {
@@ -126,16 +134,26 @@ export async function refresh(refreshToken: string) {
     include: { user: true },
   });
 
-  if (!stored || stored.revokedAt || stored.expiresAt < new Date()) {
+  // Reuse of an already-revoked token → revoke entire session family for that user
+  if (stored?.revokedAt) {
+    const revoked = await revokeAllRefreshTokens(stored.userId);
+    logger.warn(
+      { userId: stored.userId, jti: payload.jti, revoked },
+      'Refresh token reuse detected; revoked token family',
+    );
+    throw new UnauthorizedError('Refresh token reuse detected');
+  }
+
+  if (!stored || stored.expiresAt < new Date()) {
     throw new UnauthorizedError('Refresh token revoked or expired');
   }
 
   if (stored.tokenHash !== hashToken(refreshToken)) {
-    // Possible reuse — revoke family
-    await prisma.refreshToken.update({
-      where: { id: stored.id },
-      data: { revokedAt: new Date() },
-    });
+    const revoked = await revokeAllRefreshTokens(stored.userId);
+    logger.warn(
+      { userId: stored.userId, jti: payload.jti, revoked },
+      'Refresh token hash mismatch; revoked token family',
+    );
     throw new UnauthorizedError('Refresh token reuse detected');
   }
 
@@ -169,6 +187,11 @@ export async function logout(refreshToken: string | undefined) {
   }
 
   return { success: true };
+}
+
+export async function logoutAll(userId: string) {
+  const count = await revokeAllRefreshTokens(userId);
+  return { success: true, revokedSessions: count };
 }
 
 export async function getMe(userId: string) {
