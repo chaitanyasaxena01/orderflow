@@ -1,7 +1,6 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
@@ -9,9 +8,12 @@ import swaggerUi from 'swagger-ui-express';
 import YAML from 'yaml';
 import { getEnv } from './config/env.js';
 import { requestIdMiddleware } from './middleware/request-id.js';
+import { requestLogger } from './middleware/request-logger.js';
+import { createGlobalRateLimiter, initRateLimiters } from './middleware/rate-limit.js';
 import { errorHandler, notFoundHandler } from './middleware/error-handler.js';
 import { prisma } from './lib/prisma.js';
 import { pingRedis } from './lib/redis.js';
+import { getMetrics, incMetric } from './lib/metrics.js';
 import { authRouter } from './modules/auth/auth.routes.js';
 import { productsRouter } from './modules/products/products.routes.js';
 import { inventoryRouter } from './modules/inventory/inventory.routes.js';
@@ -47,11 +49,15 @@ function loadOpenApiDoc(): Record<string, unknown> {
 
 export function createApp() {
   const env = getEnv();
+  // Construct rate limiters at bootstrap (required by express-rate-limit)
+  initRateLimiters();
+
   const app = express();
 
   app.set('trust proxy', 1);
 
   app.use(requestIdMiddleware);
+  app.use(requestLogger);
   app.use(helmet());
   app.use(
     cors({
@@ -71,21 +77,11 @@ export function createApp() {
   );
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-  const limiter = rateLimit({
-    windowMs: env.RATE_LIMIT_WINDOW_MS,
-    max: env.RATE_LIMIT_MAX,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: {
-      success: false,
-      error: {
-        code: 'RATE_LIMITED',
-        message: 'Too many requests, please try again later',
-      },
-    },
-    skip: () => env.NODE_ENV === 'test',
+  app.use(createGlobalRateLimiter());
+  app.use((_req, _res, next) => {
+    incMetric('http.requests');
+    next();
   });
-  app.use(limiter);
 
   app.get('/health', (_req, res) => {
     res.json({
@@ -105,9 +101,20 @@ export function createApp() {
         });
         return;
       }
+
+      const [outboxPending, outboxFailed] = await Promise.all([
+        prisma.outboxEvent.count({ where: { status: 'PENDING' } }),
+        prisma.outboxEvent.count({ where: { status: 'FAILED' } }),
+      ]);
+
       res.json({
         success: true,
-        data: { status: 'ready', database: true, redis: true },
+        data: {
+          status: 'ready',
+          database: true,
+          redis: true,
+          outbox: { pending: outboxPending, failed: outboxFailed },
+        },
       });
     } catch (err) {
       logger.error({ err }, 'Readiness check failed');
@@ -116,6 +123,10 @@ export function createApp() {
         error: { code: 'NOT_READY', message: 'Dependencies unavailable' },
       });
     }
+  });
+
+  app.get('/metrics', (_req, res) => {
+    res.json({ success: true, data: getMetrics() });
   });
 
   const openApiDoc = loadOpenApiDoc();
