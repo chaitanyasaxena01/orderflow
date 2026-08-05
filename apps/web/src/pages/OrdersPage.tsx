@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react';
-import { api, money, type Order } from '../api';
+import { api, money, orderTimeline, type Order } from '../api';
 import { useAuth } from '../auth';
 
 export function OrdersPage() {
-  const { accessToken } = useAuth();
+  const { accessToken, user } = useAuth();
   const [orders, setOrders] = useState<Order[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
+
+  const canFulfill = user?.role === 'STAFF' || user?.role === 'ADMIN';
 
   async function load() {
     if (!accessToken) return;
@@ -47,6 +49,21 @@ export function OrdersPage() {
     }
   }
 
+  async function fulfill(order: Order, action: 'process' | 'ship' | 'complete') {
+    if (!accessToken) return;
+    setBusy(order.id + action);
+    setError(null);
+    try {
+      await api.fulfill(accessToken, order.id, action);
+      setMessage(`Order ${action}ed`);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Fulfillment failed');
+    } finally {
+      setBusy(null);
+    }
+  }
+
   if (loading) return <p className="muted">Loading orders…</p>;
 
   return (
@@ -54,13 +71,13 @@ export function OrdersPage() {
       <div className="page-header">
         <h1>Orders</h1>
         <p className="muted">
-          Simulate signed payment webhooks locally (requires VITE_PAYMENT_WEBHOOK_SECRET).
+          Status timeline, payment simulation, and staff fulfillment actions.
         </p>
       </div>
       {error && <div className="error">{error}</div>}
       {message && <div className="success">{message}</div>}
       {orders.length === 0 ? (
-        <p className="empty">No orders yet.</p>
+        <p className="empty">No orders yet. Add items to your cart and checkout.</p>
       ) : (
         <div className="stack">
           {orders.map((order) => (
@@ -80,6 +97,18 @@ export function OrdersPage() {
                   )}
                 </div>
               </div>
+
+              <div className="timeline" style={{ marginTop: '0.85rem' }}>
+                {orderTimeline(order.status).map((step) => (
+                  <span
+                    key={step.label}
+                    className={`timeline-step ${step.done ? 'done' : ''}`}
+                  >
+                    {step.label}
+                  </span>
+                ))}
+              </div>
+
               {order.items && order.items.length > 0 && (
                 <ul className="muted">
                   {order.items.map((i, idx) => (
@@ -107,6 +136,40 @@ export function OrdersPage() {
                   >
                     Simulate pay failure
                   </button>
+                </div>
+              )}
+              {canFulfill && (
+                <div className="row-actions" style={{ marginTop: '0.75rem' }}>
+                  {order.status === 'PAID' && (
+                    <button
+                      className="btn primary"
+                      type="button"
+                      disabled={!!busy}
+                      onClick={() => void fulfill(order, 'process')}
+                    >
+                      Mark processing
+                    </button>
+                  )}
+                  {order.status === 'PROCESSING' && (
+                    <button
+                      className="btn primary"
+                      type="button"
+                      disabled={!!busy}
+                      onClick={() => void fulfill(order, 'ship')}
+                    >
+                      Mark shipped
+                    </button>
+                  )}
+                  {order.status === 'SHIPPED' && (
+                    <button
+                      className="btn ok"
+                      type="button"
+                      disabled={!!busy}
+                      onClick={() => void fulfill(order, 'complete')}
+                    >
+                      Mark completed
+                    </button>
+                  )}
                 </div>
               )}
             </article>

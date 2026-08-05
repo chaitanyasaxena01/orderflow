@@ -5,11 +5,71 @@ export type ApiError = {
   error: { code: string; message: string; requestId?: string };
 };
 
+const STORAGE_KEY = 'orderflow.auth';
+
+type StoredAuth = {
+  user: { id: string; email: string; firstName: string; role: string };
+  accessToken: string;
+  refreshToken?: string;
+};
+
+function readStored(): StoredAuth | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as StoredAuth;
+  } catch {
+    return null;
+  }
+}
+
+function writeStored(data: StoredAuth): void {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+}
+
+let refreshInFlight: Promise<string | null> | null = null;
+
+async function refreshAccessToken(): Promise<string | null> {
+  if (refreshInFlight) return refreshInFlight;
+
+  refreshInFlight = (async () => {
+    const stored = readStored();
+    if (!stored?.refreshToken) return null;
+    try {
+      const res = await fetch(`${API_URL}/api/v1/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken: stored.refreshToken }),
+      });
+      if (!res.ok) return null;
+      const body = (await res.json()) as {
+        data: {
+          accessToken: string;
+          refreshToken: string;
+          user: StoredAuth['user'];
+        };
+      };
+      writeStored({
+        user: body.data.user,
+        accessToken: body.data.accessToken,
+        refreshToken: body.data.refreshToken,
+      });
+      return body.data.accessToken;
+    } catch {
+      return null;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+
+  return refreshInFlight;
+}
+
 async function request<T>(
   path: string,
-  options: RequestInit & { token?: string | null } = {},
+  options: RequestInit & { token?: string | null; _retried?: boolean } = {},
 ): Promise<T> {
-  const { token, headers, ...rest } = options;
+  const { token, headers, _retried, ...rest } = options;
   const res = await fetch(`${API_URL}${path}`, {
     ...rest,
     headers: {
@@ -19,11 +79,21 @@ async function request<T>(
     },
   });
 
+  if (res.status === 401 && token && !_retried) {
+    const next = await refreshAccessToken();
+    if (next) {
+      return request<T>(path, { ...options, token: next, _retried: true });
+    }
+  }
+
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {
     const message =
       (body as ApiError)?.error?.message ?? `Request failed (${res.status})`;
-    throw new Error(message);
+    const err = new Error(message) as Error & { code?: string; status?: number };
+    err.code = (body as ApiError)?.error?.code;
+    err.status = res.status;
+    throw err;
   }
   return body as T;
 }
@@ -40,6 +110,19 @@ export const api = {
     }>('/api/v1/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
+    }),
+
+  refresh: (refreshToken: string) =>
+    request<{
+      success: true;
+      data: {
+        accessToken: string;
+        refreshToken: string;
+        user: { id: string; email: string; firstName: string; role: string };
+      };
+    }>('/api/v1/auth/refresh', {
+      method: 'POST',
+      body: JSON.stringify({ refreshToken }),
     }),
 
   products: (token?: string | null) =>
@@ -90,14 +173,17 @@ export const api = {
   orders: (token: string) =>
     request<{ success: true; data: Order[] }>('/api/v1/orders?limit=50', { token }),
 
+  fulfill: (token: string, orderId: string, action: 'process' | 'ship' | 'complete') =>
+    request<{ success: true; data: Order }>(`/api/v1/orders/${orderId}/${action}`, {
+      method: 'POST',
+      token,
+    }),
+
   simulatePayment: async (
     paymentId: string,
     orderId: string,
     event: 'payment.succeeded' | 'payment.failed',
   ) => {
-    // Frontend demo calls a thin backend path via public webhook is not possible without secret.
-    // We expose a demo helper on the API that staff/admin can use — for the demo we call
-    // the same webhook endpoint only when VITE_PAYMENT_WEBHOOK_SECRET is set (local only).
     const secret = import.meta.env.VITE_PAYMENT_WEBHOOK_SECRET as string | undefined;
     if (!secret) {
       throw new Error(
@@ -175,6 +261,7 @@ export interface Order {
   status: string;
   totalCents: number;
   createdAt: string;
+  paidAt?: string | null;
   payment?: { id: string; status: string; amountCents: number };
   items?: Array<{ productName: string; quantity: number; unitPriceCents: number }>;
 }
@@ -183,4 +270,26 @@ export function money(cents: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(
     cents / 100,
   );
+}
+
+/** Visual timeline steps for order status. */
+export function orderTimeline(status: string): Array<{ label: string; done: boolean }> {
+  const flow = [
+    'PENDING_PAYMENT',
+    'PAID',
+    'PROCESSING',
+    'SHIPPED',
+    'COMPLETED',
+  ];
+  if (status === 'PAYMENT_FAILED' || status === 'CANCELLED' || status === 'REFUNDED') {
+    return [
+      { label: 'Created', done: true },
+      { label: status.replace(/_/g, ' '), done: true },
+    ];
+  }
+  const idx = flow.indexOf(status);
+  return flow.map((s, i) => ({
+    label: s.replace(/_/g, ' '),
+    done: idx >= 0 && i <= idx,
+  }));
 }

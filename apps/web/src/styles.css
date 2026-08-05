@@ -344,3 +344,25 @@ select:focus {
   color: var(--muted);
   padding: 2rem 0;
 }
+
+.timeline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.timeline-step {
+  font-size: 0.68rem;
+  font-family: 'JetBrains Mono', monospace;
+  padding: 0.2rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  text-transform: capitalize;
+}
+
+.timeline-step.done {
+  color: var(--ok);
+  border-color: rgba(127, 217, 154, 0.45);
+  background: rgba(127, 217, 154, 0.08);
+}
